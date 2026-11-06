@@ -1,0 +1,956 @@
+#!/usr/bin/env python3
+"""
+checker.py - high-speed URL checking engine for Python Url Checker bot
+=====================================================================
+
+The bot (bot.py) uses this module in two ways:
+
+1. As a library: read_lines(), count_combinations(), iter_urls() and the
+   CheckRun class (which runs inside the bot's event loop).
+
+2. As a program: CheckRun launches several copies of this very file as
+   worker subprocesses ("python checker.py --worker"). Each worker
+   checks its own share of the URLs, so checking uses ALL your CPU
+   cores instead of just one, and the heavy network work never slows
+   down the Telegram bot itself.
+
+Why it is fast
+--------------
+* Several worker processes (one per CPU core, up to 4 by default).
+* uvloop (a much faster event loop) is used automatically if installed.
+* A fixed pool of workers pulls URLs from a generator, so even 600,000
+  combinations never create 600,000 tasks or a giant list in memory.
+* Keep-alive connections are reused (the file is requested with a
+  "Range: bytes=0-0" header, so no image data is downloaded at all).
+* DNS results are cached.
+
+Why nothing is skipped
+----------------------
+* Network errors, timeouts, HTTP 429 and 5xx answers are never treated
+  as "not found". They are retried several times with back-off, and
+  anything still failing is re-tried again in extra rounds at the end.
+* Whatever still cannot be verified after all that is reported
+  explicitly as "unverified" (and listed in a file) - it is never
+  silently counted as "not working".
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import itertools
+import json
+import os
+import random
+import re
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import quote
+
+import aiohttp
+
+CHECKER_PATH = Path(__file__).resolve()
+
+# "(Word)" placeholder - matched case-insensitively, so (word) / (WORD) work too.
+PLACEHOLDER_RE = re.compile(r"\(word\)", re.IGNORECASE)
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+BASE_HEADERS = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+# We only need the status code, so ask for a single byte. Servers that
+# support ranges answer 206 and the connection can be reused (fast).
+RANGE_HEADERS = {"Range": "bytes=0-0"}
+
+RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+RANGE_UNSUPPORTED = frozenset({400, 405, 416, 501})
+
+# check outcomes
+NO, OK, RETRY, RANGE_BAD = 0, 1, 2, 3
+
+# Files with these endings must REALLY be images (checked by their first bytes).
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+RANGE_HEAD = {"Range": "bytes=0-4095"}
+HEAD_BYTES = 4096
+
+
+def is_image_url(url: str) -> bool:
+    path = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return path.endswith(IMAGE_EXTS)
+
+
+def sniff_image(buf: bytes) -> str | None:
+    """Return the image type if the data really starts like an image, else None."""
+    if buf[:3] == b"\xff\xd8\xff":
+        return "JPEG"
+    if buf[:8] == b"\x89PNG\r\n\x1a\n":
+        return "PNG"
+    if buf[:6] in (b"GIF87a", b"GIF89a"):
+        return "GIF"
+    if buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+        return "WEBP"
+    return None
+
+
+# ============================================================
+# Lists + URL generation (shared by the bot and the workers)
+# ============================================================
+
+def read_lines(path) -> tuple[list[str], int]:
+    """Read a wordlist/linklist file.
+
+    Returns (clean_unique_lines, number_of_lines_skipped).
+    Handles UTF-8 BOM, Windows/Mac/Linux line endings, blank lines and
+    duplicates (order is preserved). A BOM at the start of a file used
+    to silently corrupt the FIRST word - that is handled here.
+    """
+    p = Path(path)
+    if not p.exists():
+        return [], 0
+    raw = p.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    cleaned = []
+    for line in text.splitlines():
+        line = line.replace("\ufeff", "").replace("\u200b", "").strip()
+        if line:
+            cleaned.append(line)
+    unique = list(dict.fromkeys(cleaned))
+    skipped = len(text.splitlines()) - len(unique)
+    return unique, skipped
+
+
+def quote_word(word: str) -> str:
+    """Make a word safe to place inside a URL (letters, digits and _ - . ~
+    are left exactly as they are)."""
+    return quote(word, safe="-_.~")
+
+
+def count_combinations(links: list[str], words: list[str]) -> int:
+    n = 0
+    for link in links:
+        n += len(words) if PLACEHOLDER_RE.search(link) else 1
+    return n
+
+
+def iter_urls(links: list[str], words: list[str]):
+    """Yield every link x word combination, lazily (no giant list)."""
+    qwords = [quote_word(w) for w in words]
+    for link in links:
+        if PLACEHOLDER_RE.search(link):
+            parts = PLACEHOLDER_RE.split(link)
+            for qw in qwords:
+                yield qw.join(parts)
+        else:
+            yield link
+
+
+# ============================================================
+# WORKER SIDE (runs inside "python checker.py --worker")
+# ============================================================
+
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+DRAIN_LIMIT = 65536
+
+
+def _congestion(st):
+    """The server pushed back (429 / 5xx / timeouts): use fewer simultaneous connections."""
+    now = time.monotonic()
+    if now - st.last_cut >= 0.3:
+        st.last_cut = now
+        st.limit = max(st.min_limit, int(st.limit * 0.7))
+        st.successes = 0
+
+
+def _success(st):
+    """Clean answers: slowly allow more simultaneous connections again."""
+    st.successes += 1
+    if st.successes >= 100:
+        st.successes = 0
+        if st.limit < st.max_limit:
+            st.limit = min(st.max_limit, st.limit + max(2, st.max_limit // 40))
+
+
+def image_size(buf: bytes) -> tuple[int, int] | None:
+    """(width, height) read from the first bytes of a JPEG / PNG / GIF / WEBP, if possible."""
+    try:
+        if buf[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = int.from_bytes(buf[16:20], "big"), int.from_bytes(buf[20:24], "big")
+        elif buf[:6] in (b"GIF87a", b"GIF89a"):
+            w, h = int.from_bytes(buf[6:8], "little"), int.from_bytes(buf[8:10], "little")
+        elif buf[:3] == b"\xff\xd8\xff":
+            w = h = 0
+            i = 2
+            while i + 9 < len(buf):
+                if buf[i] != 0xFF:
+                    break
+                marker = buf[i + 1]
+                if marker == 0xFF:
+                    i += 1
+                    continue
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                seg = int.from_bytes(buf[i + 2:i + 4], "big")
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    h, w = int.from_bytes(buf[i + 5:i + 7], "big"), int.from_bytes(buf[i + 7:i + 9], "big")
+                    break
+                i += 2 + seg
+        elif buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+            kind = buf[12:16]
+            if kind == b"VP8 ":
+                w, h = int.from_bytes(buf[26:28], "little") & 0x3FFF, int.from_bytes(buf[28:30], "little") & 0x3FFF
+            elif kind == b"VP8L":
+                bits = int.from_bytes(buf[21:25], "little")
+                w, h = (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+            elif kind == b"VP8X":
+                w, h = 1 + int.from_bytes(buf[24:27], "little"), 1 + int.from_bytes(buf[27:30], "little")
+            else:
+                return None
+        else:
+            return None
+    except Exception:
+        return None
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def _total_size(resp) -> int | None:
+    cr = resp.headers.get("Content-Range")
+    if cr and "/" in cr:
+        tail = cr.rsplit("/", 1)[1].strip()
+        if tail.isdigit():
+            return int(tail)
+    cl = resp.headers.get("Content-Length")
+    if resp.status == 200 and cl and cl.isdigit():
+        return int(cl)
+    return None
+
+
+def _clen(resp) -> int | None:
+    cl = resp.headers.get("Content-Length")
+    return int(cl) if cl is not None and cl.isdigit() else None
+
+
+async def _drain(resp, clen_n):
+    """Read a SMALL body completely so the keep-alive connection can be reused
+    for the next link (a big part of the speed). Big bodies are never read."""
+    try:
+        if clen_n is not None:
+            if clen_n <= DRAIN_LIMIT:
+                await resp.read()
+            return
+        got = 0
+        while got <= DRAIN_LIMIT:
+            chunk = await resp.content.read(16384)
+            if not chunk:
+                return
+            got += len(chunk)
+    except Exception:
+        pass
+
+
+async def _get(session, url: str, headers, st):
+    """The fast first look at a link (one tiny request). Returns (outcome, status).
+
+    Outcome OK here only means "looks like a hit - verify it strictly". Answers that are
+    identical to what the server returns for a made-up link (same size/ETag/date, or the
+    same redirect target) are rejected right here, without a second request."""
+    async with session.get(url, headers=headers, allow_redirects=False) as resp:
+        status = resp.status
+        clen_n = _clen(resp)
+        if status in (200, 206):
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype.startswith("text/html"):
+                outcome = NO
+            else:
+                sig = (_total_size(resp), resp.headers.get("ETag"), resp.headers.get("Last-Modified"))
+                outcome = NO if sig in st.base_sigs else OK
+        elif status in REDIRECT_STATUSES:
+            loc = resp.headers.get("Location") or ""
+            outcome = NO if loc and loc in st.base_redirects else OK   # OK: strict check follows it
+        elif status in RETRY_STATUSES:
+            outcome = RETRY
+        elif headers is not None and status in RANGE_UNSUPPORTED:
+            outcome = RANGE_BAD
+        else:
+            outcome = NO
+        await _drain(resp, clen_n)
+        return outcome, status
+
+
+async def _probe(session, url: str, st) -> int:
+    try:
+        outcome, status = await _get(session, url, RANGE_HEADERS, st)
+        if outcome == RANGE_BAD:  # server doesn't like Range -> plain GET
+            outcome, status = await _get(session, url, None, st)
+            if outcome == RANGE_BAD:
+                outcome = NO
+        if outcome == RETRY:
+            _congestion(st)
+        else:
+            _success(st)
+        return outcome
+    except asyncio.CancelledError:
+        raise
+    except (aiohttp.InvalidURL, aiohttp.TooManyRedirects):
+        return NO
+    except Exception:
+        # timeout, connection reset, DNS hiccup, ... -> NOT "not found"
+        _congestion(st)
+        return RETRY
+
+
+async def _fetch_head(session, url: str) -> dict:
+    """GET the first 4 KB of a file (following redirects). Returns status, the headers we
+    care about and the first bytes (used to prove it is a real image)."""
+    for headers in (RANGE_HEAD, None):
+        async with session.get(url, headers=headers, allow_redirects=True, max_redirects=5) as resp:
+            status = resp.status
+            if headers is not None and status in RANGE_UNSUPPORTED:
+                continue  # server dislikes Range -> ask again without it
+            info = {
+                "status": status,
+                "ctype": (resp.headers.get("Content-Type") or "").lower(),
+                "lm": resp.headers.get("Last-Modified"),
+                "total": _total_size(resp),
+                "head": b"",
+                "final": str(resp.url),
+                "server": resp.headers.get("Server"),
+                "etag": resp.headers.get("ETag"),
+                "cdn": (resp.headers.get("X-Cache") or resp.headers.get("CF-Cache-Status")
+                        or resp.headers.get("X-Cache-Status") or resp.headers.get("Via")),
+            }
+            if status in (200, 206):
+                buf = bytearray()
+                while len(buf) < HEAD_BYTES:
+                    chunk = await resp.content.read(HEAD_BYTES - len(buf))
+                    if not chunk:
+                        break
+                    buf += chunk
+                info["head"] = bytes(buf)
+            return info
+    return {"status": 0, "ctype": "", "lm": None, "total": None, "head": b"", "final": url}
+
+
+def _fingerprint(info: dict) -> tuple:
+    return (info["total"], hashlib.md5(info["head"]).hexdigest())
+
+
+async def _verify(session, url: str, st):
+    """Second, strict step for anything that looked like a hit.
+
+    A link only counts as WORKING when:
+      * the server answered 200/206, and it is not a web page, and
+      * for .jpg/.png/.gif/.webp links the file REALLY starts like an image, and
+      * it is NOT identical to what the server returns for a link that
+        certainly does not exist (servers that answer every link with a
+        placeholder picture / error page).
+    Returns (outcome, meta).
+    """
+    info = await _fetch_head(session, url)
+    status = info["status"]
+    if status in RETRY_STATUSES:
+        _congestion(st)
+        return RETRY, None
+    if status not in (200, 206):
+        return NO, None
+    if info["ctype"].startswith("text/html"):
+        return NO, None
+    kind = None
+    if is_image_url(url):
+        kind = sniff_image(info["head"])
+        if kind is None:
+            return NO, None
+    if _fingerprint(info) in st.baseline:
+        return NO, None
+    return OK, {"lm": info["lm"], "sz": info["total"], "ct": info["ctype"], "kind": kind}
+
+
+async def _learn_baseline(session, links: list[str], st):
+    """Ask each link pattern for a word that certainly doesn't exist and remember what the
+    server answers (a placeholder file / a redirect to a default picture). Real hits are
+    later told apart from it - cheaply, by size/ETag/date or redirect target."""
+    templates = [l for l in links if PLACEHOLDER_RE.search(l)][:60]
+    if not templates:
+        return
+    sem = asyncio.Semaphore(20)
+
+    async def one(tmpl: str, junk: str):
+        url = junk.join(PLACEHOLDER_RE.split(tmpl))
+        async with sem:
+            for attempt in range(3):
+                try:
+                    # (a) exactly what the fast first look will see for such a link
+                    async with session.get(url, headers=RANGE_HEADERS, allow_redirects=False) as resp:
+                        status = resp.status
+                        loc = resp.headers.get("Location") or ""
+                        sig = (_total_size(resp), resp.headers.get("ETag"), resp.headers.get("Last-Modified"))
+                        await _drain(resp, _clen(resp))
+                    if status in RETRY_STATUSES:
+                        await asyncio.sleep(0.5)
+                        continue
+                    if status in REDIRECT_STATUSES:
+                        st.soft404 = True
+                        if loc:
+                            st.base_redirects.add(loc)
+                    elif status in (200, 206):
+                        st.soft404 = True
+                        if sig[0] is not None and (sig[1] or sig[2]):
+                            st.base_sigs.add(sig)
+                    # (b) the strict fingerprint (follows redirects, looks at the file itself)
+                    if status in REDIRECT_STATUSES or status in (200, 206):
+                        info = await _fetch_head(session, url)
+                        if info["status"] in (200, 206):
+                            st.baseline.add(_fingerprint(info))
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.sleep(0.3 * (attempt + 1))
+
+    junks = ["zqx" + os.urandom(4).hex() + "k", "qwv" + os.urandom(4).hex() + "m"]
+    try:
+        await asyncio.wait_for(asyncio.gather(*(one(t, j) for t in templates for j in junks)), 30)
+    except asyncio.TimeoutError:
+        pass  # never let this hold up the real check
+
+
+async def _check(session, url: str, attempts: int, base_delay: float, st, honor_abort: bool = True):
+    """Check one URL, retrying network-type failures.
+    Returns (outcome, meta); outcome is NO / OK / RETRY (RETRY = could not verify)."""
+    for attempt in range(attempts):
+        meta = None
+        try:
+            outcome = await _probe(session, url, st)       # step 1: cheap look
+            if outcome == OK:
+                outcome, meta = await _verify(session, url, st)   # step 2: strict proof
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.InvalidURL, aiohttp.TooManyRedirects):
+            return NO, None
+        except Exception:
+            _congestion(st)
+            outcome = RETRY
+        if outcome != RETRY:
+            st.consec = 0
+            return outcome, meta
+        st.consec += 1
+        st.errors += 1
+        if honor_abort and st.consec >= st.abort_after:
+            st.abort = True
+            return RETRY, None
+        if attempt + 1 < attempts:
+            await asyncio.sleep(base_delay * (2 ** attempt) * (0.5 + random.random()))
+    return RETRY, None
+
+
+class _Out:
+    """Buffered JSON-lines writer to stdout (parent process reads it)."""
+
+    def __init__(self):
+        self.buf: list[str] = []
+
+    def emit(self, obj: dict):
+        self.buf.append(json.dumps(obj, separators=(",", ":")))
+
+    def flush(self):
+        if not self.buf:
+            return
+        data = "\n".join(self.buf) + "\n"
+        self.buf.clear()
+        try:
+            sys.stdout.write(data)
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            os._exit(1)  # parent is gone -> stop
+
+
+def _watch_stdin(loop, ev: asyncio.Event):
+    """Parent sends a line (or closes the pipe) to ask us to stop."""
+    try:
+        sys.stdin.readline()
+    except Exception:
+        pass
+    try:
+        loop.call_soon_threadsafe(ev.set)
+    except RuntimeError:
+        pass
+
+
+async def _shard(cfg: dict):
+    idx, nprocs = cfg["idx"], cfg["nprocs"]
+    conc, attempts = cfg["concurrency"], cfg["attempts"]
+    out = _Out()
+    st = SimpleNamespace(
+        processed=0, errors=0, consec=0, abort=False, exhausted=False,
+        abort_after=cfg["abort_after"], phase="main", pending_retry=0,
+        baseline=set(), base_sigs=set(), base_redirects=set(), soft404=False,
+        # adaptive speed: how many connections the server currently tolerates
+        limit=conc, max_limit=conc, min_limit=max(5, conc // 20), last_cut=0.0, successes=0,
+    )
+    # This worker's share: every nprocs-th URL, starting at idx.
+    urls = itertools.islice(iter_urls(cfg["links"], cfg["words"]), idx, None, nprocs)
+    deferred: list[str] = []
+
+    loop = asyncio.get_running_loop()
+    cancel_ev = asyncio.Event()
+    threading.Thread(target=_watch_stdin, args=(loop, cancel_ev), daemon=True).start()
+
+    connector = aiohttp.TCPConnector(
+        limit=conc, limit_per_host=0, ttl_dns_cache=600, ssl=False, force_close=False,
+    )
+    timeout = aiohttp.ClientTimeout(total=cfg["total_timeout"], connect=cfg["connect_timeout"])
+
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout, headers=BASE_HEADERS,
+        cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False,
+    ) as session:
+
+        await _learn_baseline(session, cfg["links"], st)
+
+        async def first_pass_worker(wid: int):
+            while not st.abort and not st.exhausted:
+                if wid >= st.limit:          # the server is pushing back: this worker rests for now
+                    await asyncio.sleep(0.2)
+                    continue
+                try:
+                    url = next(urls)
+                except StopIteration:
+                    st.exhausted = True
+                    return
+                r, meta = await _check(session, url, attempts, 0.25, st)
+                st.processed += 1
+                if r == OK:
+                    out.emit({"t": "f", "u": url, "m": meta})
+                elif r == RETRY:
+                    deferred.append(url)
+
+        async def retry_round(items: list[str], conc2: int, attempts2: int) -> list[str]:
+            it = iter(items)
+            still: list[str] = []
+
+            async def w():
+                while True:
+                    try:
+                        url = next(it)
+                    except StopIteration:
+                        return
+                    r, meta = await _check(session, url, attempts2, 0.3, st, honor_abort=False)
+                    if r == OK:
+                        out.emit({"t": "f", "u": url, "m": meta})
+                    if r == RETRY:
+                        still.append(url)
+                    st.pending_retry -= 1
+
+            await asyncio.gather(*(w() for _ in range(conc2)))
+            return still
+
+        async def run_all():
+            await asyncio.gather(*(first_pass_worker(i) for i in range(conc)))
+            if st.abort:
+                return
+            for rnd in range(cfg["final_rounds"]):
+                if not deferred:
+                    break
+                st.phase = "retry"
+                await asyncio.sleep(1.5 * (rnd + 1))  # let the network/server cool down
+                items = deferred[:]
+                deferred.clear()
+                st.pending_retry = len(items)
+                still = await retry_round(items, max(10, conc // 5), attempts + 2)
+                deferred.extend(still)
+                st.pending_retry = len(deferred)
+
+        async def reporter():
+            while True:
+                pending = len(deferred) if st.phase == "main" else st.pending_retry
+                out.emit({"t": "p", "i": idx, "n": st.processed, "r": pending, "e": st.errors, "ph": st.phase, "l": st.limit})
+                out.flush()
+                await asyncio.sleep(0.25)
+
+        rep = asyncio.create_task(reporter())
+        main_task = asyncio.create_task(run_all())
+        cancel_task = asyncio.create_task(cancel_ev.wait())
+
+        cancelled = False
+        done, _ = await asyncio.wait({main_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+        if main_task not in done:
+            cancelled = True
+            main_task.cancel()
+            await asyncio.gather(main_task, return_exceptions=True)
+        else:
+            cancel_task.cancel()
+            main_task.result()  # re-raise unexpected errors
+        rep.cancel()
+        await asyncio.gather(rep, cancel_task, return_exceptions=True)
+
+    unverified = list(deferred)
+    if st.abort:
+        unverified.extend(urls)  # everything not even attempted
+
+    unv_file = None
+    if unverified and cfg.get("outdir") and not cancelled:
+        unv_file = str(Path(cfg["outdir"]) / f"unverified_{idx}.txt")
+        Path(unv_file).write_text("\n".join(unverified) + "\n", encoding="utf-8")
+
+    out.emit({
+        "t": "d", "i": idx, "n": st.processed, "e": st.errors,
+        "unv": 0 if cancelled else len(unverified), "unv_file": unv_file,
+        "abort": st.abort, "cancel": cancelled, "soft": st.soft404,
+    })
+    out.flush()
+
+
+def _run_loop(coro_factory):
+    try:
+        import uvloop  # optional, 2x faster event loop
+        if hasattr(uvloop, "run"):
+            return uvloop.run(coro_factory())
+        uvloop.install()
+    except ImportError:
+        pass
+    return asyncio.run(coro_factory())
+
+
+def worker_main():
+    try:
+        import resource  # Unix only: allow many open sockets
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = hard if hard != resource.RLIM_INFINITY else 65535
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, min(want, 65535)), hard))
+    except Exception:
+        pass
+
+    cfg = json.loads(sys.stdin.readline())
+    try:
+        _run_loop(lambda: _shard(cfg))
+    except BaseException as e:  # report instead of dying silently
+        try:
+            sys.stdout.write(json.dumps({"t": "x", "msg": repr(e)}) + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(1)
+    # os._exit: a daemon thread may still be blocked reading stdin.
+    sys.stdout.flush()
+    os._exit(0)
+
+
+# ============================================================
+# PARENT SIDE (used by bot.py)
+# ============================================================
+
+class CheckRun:
+    """One full check of every link x every word, spread over worker processes."""
+
+    def __init__(
+        self,
+        links: list[str],
+        words: list[str],
+        *,
+        workdir: str | Path,
+        processes: int | None = None,
+        concurrency: int = 600,
+        connect_timeout: float = 8.0,
+        total_timeout: float = 15.0,
+        attempts: int = 3,
+        final_rounds: int = 3,
+        abort_after: int = 1500,
+        small_run: int = 5000,
+    ):
+        self.links, self.words = links, words
+        self.total = count_combinations(links, words)
+        self.workdir = Path(workdir)
+        self.processes = processes or max(1, min(os.cpu_count() or 1, 4))
+        self.concurrency = concurrency
+        self.opts = dict(
+            connect_timeout=connect_timeout, total_timeout=total_timeout,
+            attempts=attempts, final_rounds=final_rounds, abort_after=abort_after,
+        )
+        self.small_run = small_run
+
+        self.found: list[str] = []
+        self.found_meta: dict[str, dict] = {}
+        self.soft404 = False
+        self.shards: dict[int, dict] = {}
+        self.unverified_count = 0
+        self.unverified_files: list[str] = []
+        self.errors: list[str] = []
+        self.crashed: list[int] = []
+        self.aborted = False
+        self.cancelled = False
+        self.finished = False
+        self.nprocs = 0
+        self.per_conc = 0
+        self.started: float | None = None
+        self.finished_at: float | None = None
+
+        self._procs: list = []
+        self._samples: deque = deque()
+        self._on_found = None
+        self._kill_timer = None
+
+    # ---------- progress ----------
+    @property
+    def processed(self) -> int:
+        return sum(s["n"] for s in self.shards.values())
+
+    @property
+    def suspicious(self) -> bool:
+        """True when an abnormal share of links look "working" - real hits are rare."""
+        return self.processed >= 300 and len(self.found) > 0.25 * self.processed
+
+    def elapsed(self) -> float:
+        if self.started is None:
+            return 0.0
+        return (self.finished_at or time.monotonic()) - self.started
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        processed = self.processed
+        retrying = sum(s["r"] for s in self.shards.values())
+        errors = sum(s.get("e", 0) for s in self.shards.values())
+
+        self._samples.append((now, processed))
+        while len(self._samples) > 2 and now - self._samples[0][0] > 30:
+            self._samples.popleft()
+        t0, p0 = self._samples[0]
+        if now - t0 >= 2 and processed > p0:
+            speed = (processed - p0) / (now - t0)          # recent speed
+        else:
+            el = self.elapsed()
+            speed = processed / el if el > 0 else 0.0     # average so far
+
+        remaining = max(0, self.total - processed)
+        eta = remaining / speed if speed > 0 and remaining > 0 else None
+        in_retry = processed >= self.total and retrying > 0
+        return {
+            "total": self.total, "processed": processed, "found": len(self.found),
+            "retrying": retrying, "errors": errors, "speed": speed, "eta": eta,
+            "elapsed": self.elapsed(), "in_retry": in_retry, "processes": self.nprocs,
+            "conns": sum(sh.get("l") or 0 for sh in self.shards.values()),
+            "conns_max": self.per_conc * self.nprocs,
+        }
+
+    # ---------- control ----------
+    def cancel(self):
+        """Ask all workers to stop (they flush what they found, then exit)."""
+        if self.cancelled or self.finished:
+            return
+        self.cancelled = True
+        self._send_cancel()
+        try:
+            self._kill_timer = asyncio.get_running_loop().call_later(8, self.shutdown)
+        except RuntimeError:
+            pass
+
+    def _send_cancel(self):
+        for p in self._procs:
+            try:
+                p.stdin.write(b"cancel\n")
+            except Exception:
+                pass
+
+    def shutdown(self):
+        """Hard-stop every worker right now."""
+        for p in self._procs:
+            if p.returncode is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+    # ---------- running ----------
+    async def run(self, on_found=None):
+        self._on_found = on_found
+        self.started = time.monotonic()
+        try:
+            if self.total == 0:
+                return
+            self.nprocs = 1 if self.total < self.small_run else max(1, min(self.processes, self.total))
+            per_conc = max(10, self.concurrency // self.nprocs)
+            self.workdir.mkdir(parents=True, exist_ok=True)
+
+            for i in range(self.nprocs):
+                cfg = dict(self.opts, idx=i, nprocs=self.nprocs, concurrency=per_conc,
+                           links=self.links, words=self.words, outdir=str(self.workdir))
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, str(CHECKER_PATH), "--worker",
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    limit=4 * 1024 * 1024,
+                )
+                self._procs.append(proc)
+                self.shards[i] = {"n": 0, "r": 0, "e": 0, "l": per_conc, "done": False}
+                self.per_conc = per_conc
+                proc.stdin.write((json.dumps(cfg) + "\n").encode("ascii"))
+                await proc.stdin.drain()
+                if self.cancelled:
+                    break
+
+            if self.cancelled:
+                self._send_cancel()
+
+            await asyncio.gather(*(self._reader(i, p) for i, p in enumerate(self._procs)))
+        finally:
+            if self._kill_timer is not None:
+                self._kill_timer.cancel()
+            for p in self._procs:
+                try:
+                    if p.stdin and not p.stdin.is_closing():
+                        p.stdin.close()
+                except Exception:
+                    pass
+            self.shutdown()
+            for p in self._procs:
+                try:
+                    await asyncio.wait_for(p.wait(), 5)
+                except Exception:
+                    pass
+            self.finished_at = time.monotonic()
+            self.finished = True
+
+    async def _reader(self, i: int, proc):
+        got_done = False
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if self._handle(i, msg):
+                    got_done = True
+        except Exception as e:
+            self.errors.append(f"reader {i}: {e!r}")
+        finally:
+            try:
+                await asyncio.wait_for(proc.wait(), 10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            if not got_done and not self.cancelled:
+                self.crashed.append(i)
+
+    def _handle(self, i: int, msg: dict) -> bool:
+        t = msg.get("t")
+        sh = self.shards[i]
+        if t == "f":
+            url = msg["u"]
+            meta = msg.get("m") or {}
+            self.found.append(url)
+            self.found_meta[url] = meta
+            if self._on_found:
+                try:
+                    self._on_found(url, meta)
+                except Exception:
+                    pass
+        elif t == "p":
+            sh["n"], sh["r"], sh["e"] = msg["n"], msg["r"], msg.get("e", 0)
+            sh["l"] = msg.get("l", sh.get("l"))
+        elif t == "d":
+            sh.update(n=msg["n"], r=0, e=msg.get("e", 0), done=True)
+            self.unverified_count += msg.get("unv", 0)
+            if msg.get("unv_file"):
+                self.unverified_files.append(msg["unv_file"])
+            if msg.get("abort"):
+                self.aborted = True
+            if msg.get("soft"):
+                self.soft404 = True
+            return True
+        elif t == "x":
+            self.errors.append(str(msg.get("msg")))
+        return False
+
+    def write_unverified(self, dest: str | Path, limit: int = 200_000) -> int:
+        """Merge the workers' unverified lists into one file. Returns lines written."""
+        written = 0
+        with open(dest, "w", encoding="utf-8") as out:
+            for f in self.unverified_files:
+                try:
+                    with open(f, encoding="utf-8") as src:
+                        for line in src:
+                            if written >= limit:
+                                return written
+                            out.write(line)
+                            written += 1
+                except OSError:
+                    pass
+        return written
+
+
+
+# ============================================================
+# SINGLE LINK DIAGNOSIS (used by /test)
+# ============================================================
+
+def control_url(url: str) -> str:
+    """The same link with its file name changed so it certainly doesn't exist."""
+    base = url.split("?", 1)[0].split("#", 1)[0]
+    name = base.rsplit("/", 1)[-1]
+    stem, dot, ext = name.rpartition(".")
+    new = (stem + "_zqx0k9" + dot + ext) if dot else (name + "_zqx0k9")
+    return base[: len(base) - len(name)] + new
+
+
+async def _inspect_one(session, url: str) -> dict:
+    t0 = time.monotonic()
+    try:
+        info = await _fetch_head(session, url)
+    except Exception as e:
+        return {"url": url, "error": f"{type(e).__name__}: {e}"[:200]}
+    info["ms"] = int((time.monotonic() - t0) * 1000)
+    info["url"] = url
+    good = info["status"] in (200, 206)
+    info["kind"] = sniff_image(info["head"]) if good else None
+    info["dims"] = image_size(info["head"]) if good else None
+    info["fp"] = _fingerprint(info) if good else None
+    info["redirected"] = info["final"].rstrip("/") != url.rstrip("/")
+    return info
+
+
+def judge(url: str, main: dict, ctrl: dict | None) -> tuple[bool, str]:
+    """Same rules as the real check. Returns (is_working, reason)."""
+    if main.get("error"):
+        return False, f"the request failed ({main['error']})"
+    status = main["status"]
+    if status in RETRY_STATUSES:
+        return False, f"the server answered HTTP {status} (temporary error - try again)"
+    if status not in (200, 206):
+        return False, f"the server answered HTTP {status}"
+    if main["ctype"].startswith("text/html"):
+        return False, "it is a web page, not a file"
+    if is_image_url(url) and main["kind"] is None:
+        return False, "the content is not a real image"
+    if ctrl and not ctrl.get("error") and ctrl.get("fp") is not None and ctrl["fp"] == main["fp"]:
+        return False, "it is identical to what the server returns for a link that does not exist (a placeholder)"
+    return True, "real image" if main["kind"] else "the file exists"
+
+
+async def inspect_url(url: str, timeout: float = 20.0) -> dict:
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=aiohttp.ClientTimeout(total=timeout), headers=BASE_HEADERS,
+        cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False,
+    ) as session:
+        main = await _inspect_one(session, url)
+        ctrl = await _inspect_one(session, control_url(url))
+    ok, reason = judge(url, main, ctrl)
+    return {"main": main, "control": ctrl, "ok": ok, "reason": reason}
+
+
+if __name__ == "__main__":
+    if "--worker" in sys.argv:
+        worker_main()
+    else:
+        print("This file is the checking engine used by bot.py. Run bot.py instead.")
